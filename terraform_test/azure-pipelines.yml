@@ -1,0 +1,163 @@
+parameters:
+  - name: env
+    displayName: Environment
+    type: string
+    default: dev
+    values:
+      - dev
+      - tst
+      - prod
+  - name: TfPlanPath
+    displayName: Terraform Plan Path
+    type: string
+    default: $(System.DefaultWorkingDirectory)/terraform_test/terraform.tfplan
+  - name: ConfSourceFolder
+    displayName: Terraform Configuration Folder
+    type: string
+    default: terraform
+
+trigger:
+  - feature/*
+
+variables:
+  - group: Terraform-Pipeline-Test
+
+stages:
+  - stage: Authenticate
+    jobs:
+      - job: Authenticate
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - task: AzureCLI@2
+            displayName: "Authenticate with Azure"
+            inputs:
+              azureSubscription: "terraform-sp" # Service Connection
+              scriptType: "bash"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                subscriptionId=$(az account show --query 'id' -o tsv)
+                echo "Selected subscription: $subscriptionId"
+                az account set --subscription $subscriptionId
+            env:
+              ARM_TENANT_ID: $(tenantId)
+              ARM_CLIENT_ID: $(servicePrincipalId)
+              ARM_CLIENT_SECRET: $(servicePrincipalKey)
+              subscriptionId: $(subscriptionId)
+          - task: ms-devlabs.custom-terraform-tasks.custom-terraform-installer-task.TerraformInstaller@0
+            displayName: "Install Terraform"
+            inputs:
+              terraformVersion: "1.4.4"
+  - stage: TerraformPlan
+    dependsOn: Authenticate
+    displayName: "Terraform Plan"
+    jobs:
+      - job: Plan
+        displayName: "Plan"
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          - task: AzureCLI@2
+            displayName: Terraform Init
+            inputs:
+              workingDirectory: $(System.DefaultWorkingDirectory)/terraform_test/
+              azureSubscription: "terraform-sp" # Service Connection
+              scriptType: bash
+              scriptLocation: inlineScript
+              addSpnToEnvironment: true
+              inlineScript: |
+                export AAD_USE_MICROSOFT_GRAPH=1
+                export ARM_CLIENT_ID=$servicePrincipalId
+                export ARM_CLIENT_SECRET=$servicePrincipalKey
+                export ARM_TENANT_ID=$tenantId
+                export TF_IN_AUTOMATION=true
+
+                terraform init \
+                -input=false \
+                -backend-config="resource_group_name=${TF_STORAGE_RG}" \
+                -backend-config="storage_account_name=${TF_STORAGE_ACCOUNT}" \
+                -backend-config="container_name=${TF_STORAGE_BLOB_CONTAINER}" \
+                -backend-config=key=${{ parameters.env }}.tfstate
+
+          - task: AzureCLI@2
+            displayName: Terraform Plan
+            inputs:
+              workingDirectory: $(System.DefaultWorkingDirectory)/terraform_test/
+              azureSubscription: "terraform-sp" # Service Connection
+              scriptType: bash
+              scriptLocation: inlineScript
+              addSpnToEnvironment: true
+              displayName: Check artifact staging directory
+              inlineScript: |
+                export AAD_USE_MICROSOFT_GRAPH=1
+                export ARM_CLIENT_ID=$servicePrincipalId
+                export ARM_CLIENT_SECRET=$servicePrincipalKey
+                export ARM_TENANT_ID=$tenantId
+                export TF_IN_AUTOMATION=true
+
+                chmod -R +x .terraform
+                terraform plan \
+                -input=false \
+                -var-file=environments/${{ parameters.env }}.tfvars \
+                -out=${{ parameters.TfPlanPath }}
+
+          - task: AzureCLI@2
+            displayName: "Download Terraform state file"
+            inputs:
+              workingDirectory: $(System.DefaultWorkingDirectory)/terraform_test/
+              azureSubscription: "terraform-sp"
+              scriptLocation: "inlineScript"
+              scriptType: "bash"
+              addSpnToEnvironment: true
+              inlineScript: |
+                az storage blob download --account-name ${TF_STORAGE_ACCOUNT} --account-key ${TF_STORAGE_ACCOUNT_KEY} \
+                  --container-name ${TF_STORAGE_BLOB_CONTAINER} --name ${{ parameters.env }}.tfstate \
+                  --file previous.tfstate
+
+          - task: PublishPipelineArtifact@1
+            displayName: Publish Plan artifact
+            inputs:
+              targetPath: $(System.DefaultWorkingDirectory)/terraform_test/
+              artifactName: "terraform_plan"
+              publishLocation: "pipeline"
+
+  - stage: Terraform_Apply
+    jobs:
+      - deployment: terraform
+        condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+        displayName: "Terraform Apply"
+        pool:
+          vmImage: ubuntu-latest
+        environment: ${{ parameters.env }}
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: DownloadPipelineArtifact@2
+                  inputs:
+                    artifactName: "terraform_plan"
+                    path: $(System.DefaultWorkingDirectory)/terraform_test/
+
+                - task: AzureCLI@2
+                  displayName: Terraform Apply
+                  inputs:
+                    workingDirectory: $(System.DefaultWorkingDirectory)/terraform_test/
+                    azureSubscription: "terraform-sp" # Service Connection
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    addSpnToEnvironment: true
+                    inlineScript: |
+                      ls -la
+                      export AAD_USE_MICROSOFT_GRAPH=1
+                      export ARM_CLIENT_ID=$servicePrincipalId
+                      export ARM_CLIENT_SECRET=$servicePrincipalKey
+                      export ARM_TENANT_ID=$tenantId
+                      export TF_IN_AUTOMATION=true
+
+                      chmod -R +x .terraform
+                      terraform version
+                      terraform apply \
+                      -input=false \
+                      -var-file=environments/${{ parameters.env }}.tfvars \
+                      -auto-approve
+                    terraformVersion: "1.4.4"
